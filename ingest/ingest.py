@@ -78,27 +78,70 @@ def parse(payload: bytes) -> list[dict]:
     return payload_list 
     
 def process_batch(readings):
-    """Write one batch in a single transaction.
+    """Write one batch in a single transaction."""
 
-    TODO(you):
-      1. INSERT each reading INTO readings ... ON CONFLICT (msg_id) DO NOTHING
-      2. If a row was inserted (cursor.rowcount == 1) -> audit_log 'accepted'
-         else -> audit_log 'duplicate_rejected'
-      3. All of this inside ONE transaction:  with get_conn().transaction(): ...
-      Hint: ts_ms -> timestamptz with  to_timestamp(%s / 1000.0)
-    """
-    raise NotImplementedError
-
+    conn = get_conn() 
+    with conn.transaction():
+        with conn.cursor() as cur: 
+            for reading in readings: 
+                cur.execute(
+                    """INSERT INTO readings (msg_id, meter_id, ts, kwh)
+                    VALUES (%s, %s, to_timestamp(%s / 1000.00), %s)
+                    ON CONFLICT (msg_id) DO NOTHING
+                    """, 
+                    (
+                        reading["msg_id"],
+                        reading["meter_id"],
+                        reading["ts_ms"],
+                        reading["kwh"]
+                    ),
+                )
+                
+                status = "accepted" if cur.rowcount == 1 else "duplicate_rejected"
+                
+                cur.execute(
+                    """INSERT INTO audit_log (msg_id, event, detail)
+                    VALUES (%s, %s, %s)
+                    """,
+                    (
+                        reading["msg_id"],
+                        status,
+                        json.dumps(reading)
+                    ),
+                )
+    print(f"Processed batch of {len(readings)} readings", flush=True)
 
 def dead_letter(payload: bytes, error: str):
-    # TODO(you): INSERT INTO dead_letter + audit_log 'dead_lettered' (one transaction)
-    return 
-
+    conn = get_conn() 
+    with conn.transaction():
+        with conn.cursor() as cur: 
+            cur.execute(
+                """INSERT INTO dead_letter (raw_payload, error)
+                VALUES (%s, %s)
+                """,
+                (
+                    payload.decode("utf-8", errors="replace"), # raw bytes? 
+                    error
+                ),
+            )
+            if cur.rowcount == 1: 
+                cur.execute(
+                    """INSERT INTO audit_log (msg_id, event, detail)
+                    VALUES (%s, %s, %s)
+                    """,
+                    (
+                        None,
+                        "dead_lettered",
+                        json.dumps({"error": error})
+                    ),
+                )
+    print("Added to dead letter queue", flush=True) 
+    
 
 def on_message(client, userdata, msg):
     try:
         readings = parse(msg.payload)
-    except (ValueError, json.JSONDecodeError) as e:
+    except (ValueError) as e:
         dead_letter(msg.payload, str(e))      # bad input never crashes the consumer
         client.ack(msg.mid, msg.qos)
         return
@@ -107,12 +150,19 @@ def on_message(client, userdata, msg):
         try:
             process_batch(readings)
             break
-        except psycopg.OperationalError as e:  # DB down: don't ack, retry until it's back
+        except (psycopg.IntegrityError, psycopg.DataError) as e: 
+            dead_letter(msg.payload, f"{type(e).__name__}: {e}")
+            client.ack(msg.mid, msg.qos)
+            return                       
+        except psycopg.OperationalError as e:
+            # Temporary: DB down. Don't ack; reconnect and try again.
             print(f"DB error, will retry: {e}", flush=True)
             global conn
             conn = None
             get_conn()
-    client.ack(msg.mid, msg.qos)              # ACK only after the commit succeeded
+
+    # 3. Committed → ack
+    client.ack(msg.mid, msg.qos)
 
 
 def on_connect(client, userdata, flags, reason_code, properties):

@@ -8,6 +8,7 @@ harmless by the UNIQUE msg_id in `readings` (idempotency).
 import json
 import os
 import time
+import math 
 
 import paho.mqtt.client as mqtt
 import psycopg
@@ -33,13 +34,49 @@ def get_conn():
     return conn
 
 
-def parse(payload: bytes):
+def parse(payload: bytes) -> list[dict]:
     """Validate a batch. Return a list of reading dicts, or raise ValueError."""
-    # TODO(you): check it's a JSON list; each item has msg_id, meter_id, ts_ms, kwh
-    #            with sane types/values (kwh >= 0, ts not far in the future).
-    raise NotImplementedError
+    try: 
+        payload_list = json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as e:
+        raise ValueError(f"Invalid JSON: {e}")
+    
+    if not isinstance(payload_list, list):
+        raise ValueError("Payload is not a list")
+    
+    if len(payload_list) <= 0: 
+        raise ValueError("Empty list") 
+    
+    now_ms = int(time.time() * 1000)
+    max_future_ms = 5 * 60 * 1000 
+    
+    required_fields = {"msg_id", "meter_id", "ts_ms", "kwh"}
+    
+    for reading in payload_list: 
+        if not isinstance(reading, dict): 
+            raise ValueError("Each reading must be a dictionary")
+        
+        if not required_fields.issubset(reading): 
+            raise ValueError("Missing fields in the reading.")
+        
+        if not isinstance(reading["meter_id"], str)  or not reading["meter_id"] or not reading["meter_id"].strip(): 
+            raise ValueError("Meter ID must be non-empty")
+        
+        if not isinstance(reading["msg_id"], str) or not reading["msg_id"] or not reading["msg_id"].strip():
+            raise ValueError("Message ID must be non-empty") 
 
+        ts_ms = reading["ts_ms"]
+        kwh = reading["kwh"]
+        
+        if isinstance(ts_ms, bool) or not isinstance(ts_ms, (int)) or ts_ms < 0 or not math.isfinite(ts_ms): 
+            raise ValueError("Time must be an integer or float.")
+        if isinstance(kwh, bool) or not isinstance(kwh, (int, float)) or kwh < 0 or not math.isfinite(kwh):
+            raise ValueError("KWH must be an integer.")        
+        if ts_ms > now_ms + max_future_ms: 
+            raise ValueError("Timestamp is too far in the future") 
 
+    return payload_list 
+    
 def process_batch(readings):
     """Write one batch in a single transaction.
 
@@ -55,7 +92,7 @@ def process_batch(readings):
 
 def dead_letter(payload: bytes, error: str):
     # TODO(you): INSERT INTO dead_letter + audit_log 'dead_lettered' (one transaction)
-    raise NotImplementedError
+    return 
 
 
 def on_message(client, userdata, msg):

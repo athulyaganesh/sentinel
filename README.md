@@ -152,8 +152,21 @@ pytest -q tests/ --cov=ingest --cov=api       # with coverage (pip install pytes
 
 Observed: while ingest was blocked retrying the DB, its MQTT connection also dropped and reconnected; the persistent session kept the queued messages.
 
-### Load test
-<!-- TODO: msgs/sec, p95/p99 latency, recovery time at 100 / 1,000 / 10,000 devices — real measurements only -->
+### Load test (manual, 2026-10-24, MacBook + Docker Desktop)
+Each meter samples once per second and publishes a 5-reading batch every 5 s (`--dup-rate 0`).
+Latency = `received_at - ts` for the newest reading in each batch (so it excludes the intentional batching wait).
+
+| Devices | Readings sent/s | Stored/s | p50 / p95 / p99 latency | Data lost |
+|---|---|---|---|---|
+| 100 | 100 | ~100 (keeps up) | 93 / 131 / 137 ms | none |
+| 1,000 | 1,000 | ~1,060 (keeps up) | 583 / 1,540 / 2,054 ms | none |
+
+At 1,000 devices throughput keeps up, but tail latency rises to ~2 s: every meter publishes on the same tick, so
+1,000 batches arrive at once every 5 s and ingest works through them sequentially (thundering herd).
+Next: staggered publish offsets, then 10,000 devices to find the throughput ceiling, then bulk inserts if ingest falls behind.
+
+Notes: gap checks taken while counts are still rising can show transient gaps (batches in flight); measure after the
+count stops increasing. `ts` comes from the host clock and `received_at` from the Docker VM clock.
 
 ## Known limitations / next
 - **`msg_id` restarts on simulator restart:** sequence numbers start at 1 each run, so a restarted simulator reuses old `msg_id`s and its new readings are rejected as duplicates. Real meters persist the counter; fix by persisting the sequence or adding a boot ID.

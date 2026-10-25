@@ -76,9 +76,9 @@ int main(int argc, char** argv) {
     std::vector<long long> seq(cfg.devices, 0);
     std::vector<std::vector<Reading>> buffer(cfg.devices);
 
-    // TODO(you): stagger devices with a per-meter offset (hash of meter_id) so they don't all publish at once.
-    // TODO(you): skip readings whose value didn't change (report-by-exception) + send a heartbeat instead.
-    // TODO(you): inject late / out-of-order readings.
+    // TODO: stagger devices with a per-meter offset (hash of meter_id) so they don't all publish at once.
+    // TODO: skip readings whose value didn't change (report-by-exception) + send a heartbeat instead.
+    // TODO: inject late / out-of-order readings.
     for (int tick = 1;; ++tick) {
         for (int d = 0; d < cfg.devices; ++d) {
             std::string meter_id = "meter-" + std::to_string(d + 1);
@@ -100,7 +100,7 @@ int main(int argc, char** argv) {
                     const char* junk = "{not valid json";
                     mosquitto_publish(mosq, nullptr, topic.c_str(), 15, junk, 1, false);
                 }
-                buffer[d].clear();   // TODO(you): only clear after the broker acks (on_publish callback)
+                buffer[d].clear();   // TODO: only clear after the broker acks (on_publish callback)
             }
         }
         std::this_thread::sleep_for(std::chrono::seconds(1));

@@ -10,13 +10,13 @@ pkg_check_modules(MOSQ REQUIRED libmosquitto)
 
 find_path(CJSON_INCLUDE_DIR
     NAMES cjson/cJSON.h
-    PATHS /yourpath/cjson/include
+    PATHS /opt/homebrew/opt/cjson/include
     REQUIRED
 )
 
 find_library(MOSQUITTO_LIBRARY
     NAMES mosquitto
-    PATHS /yourpath/mosquitto/lib
+    PATHS /opt/homebrew/opt/mosquitto/lib
     REQUIRED
 )
 
@@ -31,6 +31,3 @@ target_link_libraries(meter_sim PRIVATE
     ${MOSQUITTO_LIBRARY}
     pthread
 )
-
-
-# opt/homebrew/opt/

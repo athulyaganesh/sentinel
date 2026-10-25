@@ -123,7 +123,3 @@ def test_on_message_unknown_meter_is_dead_lettered_and_acked():
     assert count("SELECT count(*) FROM readings") == 0
     assert count("SELECT count(*) FROM dead_letter") == 1
     assert client.acked == [1]
-
-
-# TODO(stretch): outage test - publish N msgs, `docker compose stop postgres`,
-#                start it again, assert all N msg_ids end up in `readings`.

@@ -75,7 +75,7 @@ jobs:
     needs: lint
     steps:
       - uses: actions/checkout@v4
-      - run: sudo apt-get update && sudo apt-get install -y libmosquitto-dev libcjson-devcmake g++ pkg-config
+      - run: sudo apt-get update && sudo apt-get install -y libmosquitto-dev libcjson-dev cmake g++ pkg-config
       - run: cmake -S simulator -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS="-Wall -Wextra -Werror"
       - run: cmake --build build
       - uses: actions/upload-artifact@v4

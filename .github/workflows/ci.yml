@@ -1,25 +1,138 @@
 name: ci
-on: [push, pull_request]
+
+on:
+  push:
+  pull_request:
+
+# Cancel an older run on the same branch when a new commit is pushed.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.12"
+  DATABASE_URL: postgresql://sentinel:sentinel@localhost:5432/sentinel
+
 jobs:
-  test:
+  # 1. Static checks: fast, fail early.
+  lint:
     runs-on: ubuntu-latest
-    services:
-      postgres:
-        image: postgres:16
-        env: {POSTGRES_USER: sentinel, POSTGRES_PASSWORD: sentinel, POSTGRES_DB: sentinel}
-        ports: ["5432:5432"]
-        options: >-
-          --health-cmd "pg_isready -U sentinel" --health-interval 3s --health-retries 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
-        with: {python-version: "3.12"}
-      - run: pip install -r ingest/requirements.txt pytest
-      - run: PGPASSWORD=sentinel psql -h localhost -U sentinel -d sentinel -f db/schema.sql
-      - run: pytest -q
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - run: pip install ruff
+      - name: Ruff (syntax errors, undefined names, unused imports)
+        run: ruff check --select E4,E7,E9,F .
+
+  # 2. Pure unit tests: no database or broker.
+  unit:
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: "**/requirements.txt"
+      - run: pip install -r ingest/requirements.txt pytest pytest-cov
+      - run: pytest -q tests/test_parse.py --cov=ingest --cov-report=term-missing
+
+  # 3. Integration tests against a real Postgres.
+  integration:
+    runs-on: ubuntu-latest
+    needs: lint
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: sentinel
+          POSTGRES_PASSWORD: sentinel
+          POSTGRES_DB: sentinel
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U sentinel"
+          --health-interval 3s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: "**/requirements.txt"
+      - run: pip install -r ingest/requirements.txt -r api/requirements.txt pytest pytest-cov httpx
+      - name: Load schema
+        run: PGPASSWORD=sentinel psql -h localhost -U sentinel -d sentinel -v ON_ERROR_STOP=1 -f db/schema.sql
+      - name: Ingest + API tests
+        run: pytest -q tests/test_ingest.py tests/test_api.py --cov=ingest --cov=api --cov-report=term-missing
+
+  # 4. C++ simulator: must compile cleanly with warnings treated as errors.
   simulator:
     runs-on: ubuntu-latest
+    needs: lint
     steps:
       - uses: actions/checkout@v4
       - run: sudo apt-get update && sudo apt-get install -y libmosquitto-dev cmake g++ pkg-config
-      - run: cmake -S simulator -B build && cmake --build build
+      - run: cmake -S simulator -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS="-Wall -Wextra -Werror"
+      - run: cmake --build build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: meter_sim
+          path: build/meter_sim
+
+  # 5. Containers: compose file is valid and every image builds.
+  docker:
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker compose config -q
+      - run: docker compose build
+
+  # 6. End-to-end: simulator -> Mosquitto -> ingest -> Postgres, with duplicates injected.
+  e2e:
+    runs-on: ubuntu-latest
+    needs: [unit, integration, simulator, docker]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: meter_sim
+          path: build
+      - run: sudo apt-get update && sudo apt-get install -y libmosquitto1 && chmod +x build/meter_sim
+      - name: Start stack
+        run: docker compose up -d --build postgres mosquitto ingest
+      - name: Wait for ingest to subscribe
+        run: |
+          for i in $(seq 1 60); do
+            docker compose logs ingest | grep -q "MQTT connected" && exit 0
+            sleep 2
+          done
+          echo "ingest never connected"; exit 1
+      - name: Run simulator for 20s (50% duplicate batches)
+        run: timeout 20 ./build/meter_sim --devices 10 --batch-seconds 2 --dup-rate 0.5 || [ $? -eq 124 ]
+      - name: Let ingest drain
+        run: sleep 5
+      - name: Assert data landed and duplicates were rejected
+        run: |
+          q() { docker compose exec -T postgres psql -U sentinel -d sentinel -tAc "$1"; }
+          readings=$(q "SELECT count(*) FROM readings")
+          dups=$(q "SELECT count(*) FROM audit_log WHERE event='duplicate_rejected'")
+          dead=$(q "SELECT count(*) FROM dead_letter")
+          unique=$(q "SELECT count(DISTINCT msg_id) = count(*) FROM readings")
+          echo "readings=$readings duplicates_rejected=$dups dead_lettered=$dead"
+          echo "| readings | duplicates rejected | dead-lettered |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| $readings | $dups | $dead |" >> $GITHUB_STEP_SUMMARY
+          [ "$readings" -gt 0 ] || { echo "no readings stored"; exit 1; }
+          [ "$dups" -gt 0 ] || { echo "no duplicates rejected"; exit 1; }
+          [ "$unique" = "t" ] || { echo "duplicate msg_id stored"; exit 1; }
+      - name: Logs on failure
+        if: failure()
+        run: docker compose logs
+      - name: Tear down
+        if: always()
+        run: docker compose down -v

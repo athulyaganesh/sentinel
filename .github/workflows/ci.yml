@@ -75,7 +75,7 @@ jobs:
     needs: lint
     steps:
       - uses: actions/checkout@v4
-      - run: sudo apt-get update && sudo apt-get install -y libmosquitto-dev cmake g++ pkg-config
+      - run: sudo apt-get update && sudo apt-get install -y libmosquitto-dev libcjson-devcmake g++ pkg-config
       - run: cmake -S simulator -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS="-Wall -Wextra -Werror"
       - run: cmake --build build
       - uses: actions/upload-artifact@v4
@@ -102,7 +102,7 @@ jobs:
         with:
           name: meter_sim
           path: build
-      - run: sudo apt-get update && sudo apt-get install -y libmosquitto1 && chmod +x build/meter_sim
+      - run: sudo apt-get update && sudo apt-get install -y libmosquitto1 libcjson1 && chmod +x build/meter_sim
       - name: Start stack
         run: docker compose up -d --build postgres mosquitto ingest
       - name: Wait for ingest to subscribe

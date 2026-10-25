@@ -9,6 +9,8 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <map>
+#include <mutex>
 #include <random>
 #include <string>
 #include <thread>
@@ -30,6 +32,18 @@ struct Config {
     int    port           = 1883;
 };
 
+// A batch the broker hasn't acknowledged yet (in-memory stand-in for the meter's flash buffer).
+struct PendingBatch {
+    std::string device_id;
+    std::string topic;
+    std::string payload;   // exact bytes sent, so a resend is identical (same msg_ids)
+    long long   sent_ms;
+};
+
+std::map<int, PendingBatch> pending_batches;   // key: MQTT message id (mid)
+std::mutex pending_batches_mutex;              // touched by main thread + libmosquitto network thread
+
+
 static long long now_ms() {
     using namespace std::chrono;
     return duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
@@ -49,6 +63,17 @@ static std::string to_json(const std::vector<Reading>& batch) {
     return out + "]";
 }
 
+void on_publish(struct mosquitto* /*mosq*/, void* /*obj*/, int mid) {
+    std::lock_guard<std::mutex> lock(pending_batches_mutex);
+    auto it = pending_batches.find(mid);
+    if (it != pending_batches.end()) {
+        const PendingBatch& batch = it->second;
+        std::printf("Published batch for device %s to topic %s (mid=%d)\n", batch.device_id.c_str(), batch.topic.c_str(), mid);
+        pending_batches.erase(it);
+    }
+    // else: an untracked publish (the deliberate duplicate/junk test messages) - nothing to do.
+} 
+
 int main(int argc, char** argv) {
     Config cfg;
     for (int i = 1; i + 1 < argc; i += 2) {
@@ -62,7 +87,13 @@ int main(int argc, char** argv) {
     mosquitto_lib_init();
     // Persistent session (clean_session=false) so the broker remembers us across reconnects.
     mosquitto* mosq = mosquitto_new("sentinel-simulator", /*clean_session=*/false, nullptr);
-    if (!mosq || mosquitto_connect(mosq, cfg.host, cfg.port, 30) != MOSQ_ERR_SUCCESS) {
+    if (!mosq) {
+        std::fprintf(stderr, "mosquitto_new failed\n");
+        return 1;
+    }
+    // Register before loop_start: once the network thread runs, callbacks can fire.
+    mosquitto_publish_callback_set(mosq, on_publish);
+    if (mosquitto_connect(mosq, cfg.host, cfg.port, 30) != MOSQ_ERR_SUCCESS) {
         std::fprintf(stderr, "failed to connect to MQTT at %s:%d\n", cfg.host, cfg.port);
         return 1;
     }
@@ -89,7 +120,24 @@ int main(int argc, char** argv) {
             if (tick % cfg.batch_seconds == 0) {
                 std::string topic   = "meters/" + meter_id + "/readings";
                 std::string payload = to_json(buffer[d]);
-                mosquitto_publish(mosq, nullptr, topic.c_str(), (int)payload.size(), payload.data(), /*qos=*/1, false);
+
+                // Hold the lock across publish + insert. Otherwise the broker's ack can arrive
+                // (on_publish on the network thread) BEFORE we record the mid, and the entry
+                // would be stuck in pending_batches forever.
+                int rc;
+                {
+                    std::lock_guard<std::mutex> lock(pending_batches_mutex);
+                    int mid = 0;
+                    rc = mosquitto_publish(mosq, &mid, topic.c_str(), (int)payload.size(), payload.data(), /*qos=*/1, false);
+                    if (rc == MOSQ_ERR_SUCCESS)
+                        pending_batches[mid] = PendingBatch{meter_id, topic, payload, now_ms()};
+                }
+                if (rc != MOSQ_ERR_SUCCESS) {
+                    // Not handed to the broker (e.g. disconnected): keep the readings for the next batch.
+                    std::fprintf(stderr, "publish failed for %s (rc=%d); keeping %zu readings buffered\n",
+                                 meter_id.c_str(), rc, buffer[d].size());
+                    continue;
+                }
 
                 // Simulated lost ack: resend the SAME batch (same msg_ids). Ingestion must dedupe.
                 if (coin(rng) < cfg.dup_rate)
@@ -99,8 +147,9 @@ int main(int argc, char** argv) {
                 if (coin(rng) < cfg.malformed_rate) {
                     const char* junk = "{not valid json";
                     mosquitto_publish(mosq, nullptr, topic.c_str(), 15, junk, 1, false);
+
                 }
-                buffer[d].clear();   // TODO: only clear after the broker acks (on_publish callback)
+                buffer[d].clear();   // safe: the batch now lives in pending_batches until acked
             }
         }
         std::this_thread::sleep_for(std::chrono::seconds(1));

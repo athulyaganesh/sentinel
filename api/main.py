@@ -1,7 +1,8 @@
 """Sentinel read API."""
 import os
 from datetime import datetime
-
+import billing as billing_svc
+from billing import register_before
 import psycopg
 from fastapi import FastAPI, HTTPException
 
@@ -34,21 +35,6 @@ def latest(meter_id: str):
                 raise HTTPException(404, "No readings from this meter")
 
             return {"kwh": float(row[0])}
-
-
-def register_before(cur, meter_id: str, t: datetime) -> float:
-    """Meter's running total (register) from the last reading strictly before t; 0 if none."""
-    cur.execute(
-        """
-        SELECT kwh FROM readings
-        WHERE meter_id = %s AND ts < %s
-        ORDER BY ts DESC
-        LIMIT 1
-        """,
-        (meter_id, t),
-    )
-    row = cur.fetchone()
-    return float(row[0]) if row is not None else 0.0
 
 
 @app.get("/usage/{meter_id}")
@@ -94,10 +80,37 @@ def billing(account_id: str, start: datetime, end: datetime):
             if row[0] is None: #sum 
                 raise HTTPException(404, "No ledger entries for this account in the given time range")
             return {"total_billed": row[0]} 
-            
-
+        
+ 
+@app.post("/billing/run")
+def billing_run(start: datetime, end: datetime):
+    """Bill every account for [start, end). Safe to rerun: already-billed periods are not re-charged."""
+    if start >= end:
+        raise HTTPException(400, "start must be before end")
+    with db() as conn:
+        try:
+            results = billing_svc.run_billing(conn, start, end)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+    return {
+        "billed": [
+            {"account_id": r["account_id"], "entry_id": r["entry_id"],
+             "amount_cents": r["amount_cents"], "already_billed": r["already_billed"]}
+            for r in results
+        ]
+    }
+ 
+ 
 @app.get("/reconcile/{account_id}")
-def reconcile(account_id: str):
-    # TODO: recompute expected charges for each ledger entry (+ its adjustments),
-    #            compare with posted amount_cents, return discrepancies. Never UPDATE the ledger.
-    raise HTTPException(501, "not implemented")
+def reconcile(account_id: str, start: datetime, end: datetime):
+    """Compare the posted bill (ledger + adjustments) with a fresh recomputation. Read-only."""
+    if start >= end:
+        raise HTTPException(400, "start must be before end")
+    with db() as conn:
+        with conn.cursor() as cur:
+            try:
+                return billing_svc.reconcile_account(cur, account_id, start, end)
+            except LookupError as e:          # period not billed yet
+                raise HTTPException(404, str(e))
+            except ValueError as e:           # unknown account, tariff problem
+                raise HTTPException(400, str(e))

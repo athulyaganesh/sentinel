@@ -67,7 +67,7 @@ jobs:
       - name: Load schema
         run: PGPASSWORD=sentinel psql -h localhost -U sentinel -d sentinel -v ON_ERROR_STOP=1 -f db/schema.sql
       - name: Ingest + API tests
-        run: pytest -q tests/test_ingest.py tests/test_api.py --cov=ingest --cov=api --cov-report=term-missing
+        run: pytest -q tests/test_ingest.py tests/test_api.py tests/test_billing.py --cov=ingest --cov=api --cov-report=term-missing
 
   # 4. C++ simulator: must compile cleanly with warnings treated as errors.
   simulator:

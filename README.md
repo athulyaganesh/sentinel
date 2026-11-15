@@ -1,7 +1,8 @@
 # Sentinel — Real-Time Meter Telemetry & Billing
 
 Simulated smart meters stream readings into a reliable, auditable pipeline that
-serves usage and billing.
+serves usage and billing, with an AI ops agent that answers questions about meters and bills
+using read-only tools.
 
 ```
 C++ meter simulator ──MQTT QoS1──▶ Mosquitto ──▶ Python ingestion ──▶ PostgreSQL ◀── FastAPI
@@ -15,10 +16,14 @@ C++ meter simulator ──MQTT QoS1──▶ Mosquitto ──▶ Python ingestio
 |---|---|
 | `simulator/` | C++17 smart-meter simulator (libmosquitto) |
 | `ingest/` | Python ingestion service: validate → transaction → commit → ACK, dead-letter routing |
-| `api/` | FastAPI read API (`/latest`, `/usage`) |
+| `api/` | FastAPI API: usage, billing, reconciliation |
+| `api/billing.py` | Billing and reconciliation logic (no HTTP) |
+| `api/agent_tools.py` | Read-only tools the AI agent can call |
+| `api/agent.py` | AI ops agent loop (Gemini, manual tool calling) |
+| `scripts/demo_agent_data.py` | Demo data for the agent: a billed day plus one late reading |
 | `db/schema.sql` | Schema + seed data (100 meters, 1 tariff) |
 | `mosquitto/mosquitto.conf` | Broker: persistence on, bounded queue |
-| `tests/` | Unit (`test_parse.py`), integration (`test_ingest.py`), API (`test_api.py`) |
+| `tests/` | Unit (`test_parse.py`), integration (`test_ingest.py`), API (`test_api.py`), billing (`test_billing.py`) |
 | `.github/workflows/ci.yml` | CI: lint, unit, integration, simulator, docker, end-to-end |
 
 ---
@@ -107,8 +112,65 @@ curl "localhost:8000/usage/meter-1?start=2026-10-24T00:00:00Z&end=2026-10-25T00:
 |---|---|---|
 | `GET /latest/{meter_id}` | `{"kwh": ...}` | Newest reading by timestamp; 404 if none |
 | `GET /usage/{meter_id}?start&end` | `{"kwh_used": ...}` | Register at `end` − register at `start` over `[start, end)`; 400 if `start >= end`; 404 if no readings |
+| `POST /billing/run?start&end` | `{"billed": [...]}` | Bills every account for `[start, end)`; safe to rerun (`already_billed: true`, never double-bills) |
+| `GET /billing/{account_id}?start&end` | `{"total_billed": ...}` | Sum of ledger entries in the range; 404 if none |
+| `GET /reconcile/{account_id}?start&end` | posted vs expected | Read-only check of a posted bill; 404 if the period isn't billed |
 
 Interactive docs: http://localhost:8000/docs
+
+## Billing and reconciliation
+- **Usage from a cumulative register:** usage over `[start, end)` = register before `end` − register before `start`. Half-open windows, so a boundary reading is never counted twice.
+- **Time-of-use pricing:** peak 16:00–21:00 at 22¢/kWh, off-peak 12¢/kWh (tariff `residential` v1). Exact `Decimal` maths, rounded to whole cents once.
+- **Idempotent ledger:** `UNIQUE(account_id, period_start, period_end)` + `INSERT ... ON CONFLICT DO NOTHING`; rerunning a billing run returns the existing entry.
+- **Corrections are adjustments, never edits:** the ledger is never updated.
+- **Reconciliation:** posted (ledger + adjustments) vs a fresh recomputation, plus a count of readings that arrived after the bill was posted.
+- **v1 limits:** peak hours applied in UTC; a tariff change mid-period is rejected, not split.
+
+## AI ops agent
+Ask questions in plain English; the agent answers using read-only tools over the database.
+
+```
+question ──▶ Gemini ──(tool request)──▶ call_tool() ──▶ read-only SQL ──▶ result ──▶ Gemini ──▶ answer
+                 ▲________________________ conversation history (resent each round) ______|
+```
+
+| Tool | What it does |
+|---|---|
+| `find_offline_meters(minutes)` | Meters with no reading in the last N minutes (or none ever) |
+| `get_bill_status(account_id, start, end)` | Posted vs expected cents, difference, late-reading count |
+| `list_late_readings(account_id, start, end)` | Readings that arrived after the bill was posted |
+| `get_meter_usage(meter_id, start, end)` | Peak / off-peak kWh for one meter |
+
+**Safety and reliability**
+- The model never writes SQL: it can only call the 4 fixed, parameterized tools above (allowlist).
+- Read-only connection (`conn.read_only = True`), so Postgres itself rejects any write.
+- Automatic function calling is disabled: our code runs each tool, logs it, and records it in `steps`.
+- Tool errors go back to the model as data (`{"error": ...}`) instead of crashing the loop.
+- Limits: 6 rounds max, 20 s per model call, 5 s per DB query, 45 s overall. On any limit or API error it returns a clear message.
+
+**Run it**
+```bash
+pip install -r api/requirements.txt
+# .env in the repo root (never committed):
+#   GEMINI_API_KEY=...
+#   GEMINI_MODEL=<a Flash model id, e.g. from client.models.list()>
+docker compose up -d postgres
+python3 scripts/demo_agent_data.py      # billed day for acct-1 + one late reading
+cd api && python3 try_agent.py
+```
+
+**Example (2026-11-14, Gemini Flash-Lite)**
+> **Q:** Why is acct-1's bill for 2026-11-01 to 2026-11-02 mismatched?
+> **A:** 1 late reading arrived after the bill was posted: posted 316¢, expected 340¢, 24¢ short.
+> *(tools: `get_bill_status` → `list_late_readings`)*
+
+> **Q:** How much peak vs off-peak energy did meter-1 use on 2026-11-01?
+> **A:** 10 kWh peak, 10 kWh off-peak. *(tool: `get_meter_usage`)*
+
+**Lessons so far**
+- With failing tools, the model once answered "0 kWh" anyway (hallucination). Prompting alone doesn't prevent this; a code-level guard is next.
+- The model read a late reading's register value (120 kWh) as energy used; tools should return clearly named fields (`register_kwh`, `added_kwh`).
+- Free-tier 503/504 errors are common; handled gracefully, fallback model planned.
 
 ## Tests
 ```bash
@@ -136,7 +198,7 @@ pytest -q tests/ --cov=ingest --cov=api       # with coverage (pip install pytes
 - **Idempotent ingestion:** `msg_id` is generated once on the device and is UNIQUE in `readings`; redeliveries are recorded as `duplicate_rejected`.
 - **Bad input never crashes the consumer:** malformed messages and unknown meters go to `dead_letter`; DB outages are retried with backoff (0.5 s → 10 s) without ACKing.
 - **Limit:** recovery is guaranteed only while the broker's queue stays under `max_queued_messages` (100,000).
-- **Billing (planned):** immutable readings, versioned tariffs, corrections as `adjustments`; reconciliation reports, never rewrites.
+- **Billing:** immutable readings, versioned tariffs, idempotent ledger, corrections as `adjustments`; reconciliation reports, never rewrites.
 
 ## Results
 
@@ -173,4 +235,5 @@ count stops increasing. `ts` comes from the host clock and `received_at` from th
 - Shared MQTT client ID across simulator instances (see above).
 - Ingest's DB retry blocks the MQTT network thread long enough to trip the keepalive.
 - Dev-only credentials are in `docker-compose.yml`; move to `.env` + `.env.example`.
-- Not built yet: staggered publish offsets, billing/reconcile, heartbeats, load tests.
+- Agent: no code-level hallucination guard yet; DB errors (`psycopg.Error`) not yet caught in `call_tool`; no row limits on list tools; no fallback model; no `/ask` endpoint or tests yet.
+- Not built yet: staggered publish offsets, heartbeats, 10,000-device load test.
